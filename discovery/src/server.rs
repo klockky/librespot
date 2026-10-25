@@ -14,7 +14,7 @@ use http_body_util::{BodyExt, Full};
 use hyper::{Method, Request, Response, StatusCode, body::Incoming};
 
 use hyper_util::{rt::TokioIo, server::graceful::GracefulShutdown};
-use log::{debug, error, warn};
+use log::{debug, error, info, warn};
 use serde_json::json;
 use sha1::{Digest, Sha1};
 use tokio::sync::{mpsc, oneshot};
@@ -148,15 +148,32 @@ impl RequestHandler {
             .get(clientkey_key)
             .ok_or(DiscoveryError::ParamsError(clientkey_key))?;
 
-        let encrypted_blob = BASE64.decode(encrypted_blob.as_bytes())?;
-
-        let client_key = BASE64.decode(client_key.as_bytes())?;
-        let shared_key = self.keys.shared_secret(&client_key);
-
-        let encrypted_blob_len = encrypted_blob.len();
-        if encrypted_blob_len < 16 {
-            return Err(DiscoveryError::HmacError(encrypted_blob).into());
+        if encrypted_blob.is_empty() || client_key.is_empty() {
+            info!("Zeroconf: returning public-key challenge");
+            let body = json!({
+                "status": 203,
+                "statusString": "ERROR-INVALID-PUBLICKEY",
+                "spotifyError": 0,
+                "version": "2.9.0",
+                "deviceID": self.config.device_id,
+                "publicKey": BASE64.encode(self.keys.public_key()),
+            });
+            let mut response = Response::new(Full::new(Bytes::from(body.to_string())));
+            response.headers_mut().insert(
+                hyper::header::CONTENT_TYPE,
+                hyper::header::HeaderValue::from_static("application/json"),
+            );
+            return Ok(response);
         }
+        let encrypted_blob = BASE64.decode(encrypted_blob.as_bytes())?;
+        let client_key = BASE64.decode(client_key.as_bytes())?;
+        let encrypted_blob_len = encrypted_blob.len();
+        if encrypted_blob_len < 37 {
+            return Err(Error::invalid_argument(
+                "Discovery credentials blob is too short",
+            ));
+        }
+        let shared_key = self.keys.shared_secret(&client_key);
 
         let iv = &encrypted_blob[0..16];
         let encrypted = &encrypted_blob[16..encrypted_blob_len - 20];
@@ -386,5 +403,155 @@ impl DiscoveryServer {
             let _ = task_handle.await;
             log::debug!("Discovery server stopped");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn handler() -> (RequestHandler, mpsc::UnboundedReceiver<DiscoveryEvent>) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        (
+            RequestHandler::new(
+                Config {
+                    name: "Fixture receiver".into(),
+                    device_type: DeviceType::Speaker,
+                    device_id: "fixture-device".into(),
+                    is_group: false,
+                    client_id: "fixture-client".into(),
+                    aliases: Vec::new(),
+                },
+                tx,
+            ),
+            rx,
+        )
+    }
+
+    async fn body(response: Response<Full<Bytes>>) -> serde_json::Value {
+        serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap()
+    }
+
+    fn params(blob: String, client_key: String) -> Params<'static> {
+        [
+            ("userName", "fixture-user".to_owned()),
+            ("blob", blob),
+            ("clientKey", client_key),
+        ]
+        .into_iter()
+        .map(|(key, value)| (Cow::Borrowed(key), Cow::Owned(value)))
+        .collect()
+    }
+
+    #[tokio::test]
+    async fn empty_login_probe_returns_current_key_without_authenticating() {
+        let (handler, mut events) = handler();
+        let info = body(handler.handle_get_info()).await;
+        for request in [
+            params(String::new(), String::new()),
+            params(String::new(), BASE64.encode([2])),
+            params(BASE64.encode([1]), String::new()),
+        ] {
+            let response = handler.handle_add_user(&request).unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(
+                response.headers()[hyper::header::CONTENT_TYPE],
+                "application/json"
+            );
+            let response = body(response).await;
+            assert_eq!(response["status"], 203);
+            assert_eq!(response["statusString"], "ERROR-INVALID-PUBLICKEY");
+            assert_eq!(response["spotifyError"], 0);
+            assert_eq!(response["publicKey"], info["publicKey"]);
+            assert_eq!(response["deviceID"], info["deviceID"]);
+            assert!(events.try_recv().is_err());
+            assert!(handler.active_user().is_empty());
+        }
+    }
+
+    #[test]
+    fn truncated_blobs_never_panic_authenticate_or_disclose_the_input() {
+        let (handler, mut events) = handler();
+        for length in 1..37 {
+            let request = params(BASE64.encode(vec![0xa5; length]), BASE64.encode([2]));
+            let error = handler.handle_add_user(&request).unwrap_err();
+            assert_eq!(error.kind, ErrorKind::InvalidArgument);
+            assert!(error.to_string().contains("too short"));
+            assert!(!error.to_string().contains("165"));
+        }
+        assert!(events.try_recv().is_err());
+    }
+
+    fn login_blob(handler: &RequestHandler, client: &DhLocalKeys) -> Vec<u8> {
+        let secret = client.shared_secret(&handler.keys.public_key());
+        let digest = Sha1::digest(secret);
+        let mut encryption = Hmac::<Sha1>::new_from_slice(&digest[..16]).unwrap();
+        encryption.update(b"encryption");
+        let key = encryption.finalize().into_bytes();
+        // Synthetic fixture for fixture-user / fixture-device; contains no account data.
+        let mut encrypted =
+            b"f7WVsGaqYONh93peXZL/U+tgzSrePZaGAFSkmatzGnCXay8WfSp38gJs03OqKDIr".to_vec();
+        let iv = [0x42; 16];
+        Aes128Ctr::new_from_slices(&key[..16], &iv)
+            .unwrap()
+            .apply_keystream(&mut encrypted);
+        let mut checksum = Hmac::<Sha1>::new_from_slice(&digest[..16]).unwrap();
+        checksum.update(b"checksum");
+        let key = checksum.finalize().into_bytes();
+        let mut mac = Hmac::<Sha1>::new_from_slice(&key).unwrap();
+        mac.update(&encrypted);
+        let mut blob = iv.to_vec();
+        blob.extend(encrypted);
+        blob.extend(mac.finalize().into_bytes());
+        blob
+    }
+
+    #[tokio::test]
+    async fn public_key_probe_can_be_followed_by_a_real_encrypted_login() {
+        let (handler, mut events) = handler();
+        let probe = body(
+            handler
+                .handle_add_user(&params(String::new(), String::new()))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(probe["status"], 203);
+        let client = DhLocalKeys::random(&mut rand::rng());
+        let blob = login_blob(&handler, &client);
+        let request = params(BASE64.encode(blob), BASE64.encode(client.public_key()));
+        assert_eq!(
+            body(handler.handle_add_user(&request).unwrap()).await["status"],
+            101
+        );
+        let DiscoveryEvent::Credentials(credentials) = events.try_recv().unwrap() else {
+            panic!("expected credentials")
+        };
+        assert_eq!(credentials.username.as_deref(), Some("fixture-user"));
+        assert_eq!(credentials.auth_data, b"synthetic-auth-value");
+        assert_eq!(handler.active_user(), "fixture-user");
+    }
+
+    #[tokio::test]
+    async fn modified_mac_is_still_rejected_after_a_public_key_probe() {
+        let (handler, mut events) = handler();
+        let probe = body(
+            handler
+                .handle_add_user(&params(String::new(), String::new()))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(probe["status"], 203);
+        let client = DhLocalKeys::random(&mut rand::rng());
+        let mut blob = login_blob(&handler, &client);
+        *blob.last_mut().unwrap() ^= 1;
+        let response = handler
+            .handle_add_user(&params(
+                BASE64.encode(blob),
+                BASE64.encode(client.public_key()),
+            ))
+            .unwrap();
+        assert_eq!(body(response).await["statusString"], "ERROR-MAC");
+        assert!(events.try_recv().is_err());
+        assert!(handler.active_user().is_empty());
     }
 }

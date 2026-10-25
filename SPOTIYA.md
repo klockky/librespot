@@ -9,7 +9,7 @@ media fixtures are included.
 
 Spotiya consumes this repository as a Git dependency pinned to an exact commit
 in its Cargo.toml and Cargo.lock. All librespot crates come from that same Git
-source. Its CI checks the pinned core/audio tests as well as the receiver and
+source. Its CI checks the pinned core/audio/discovery tests as well as the receiver and
 ARMv7 build. A separate PlayPlay helper remains optional.
 
 ## Login5
@@ -94,20 +94,37 @@ longer feeds encrypted bytes to Symphonia and produces repeated MP3 sync/header
 errors. The upstream unencrypted fallback for podcast episodes is retained.
 Helper setup or execution errors use the existing unavailable-track handling.
 
+## Zeroconf public-key refresh
+
+An addUser request with an empty blob or clientKey now returns HTTP 200 with
+status 203 (ERROR-INVALID-PUBLICKEY), the device ID and the current DH public
+key. This lets a controller refresh its key and retry the encrypted login.
+The challenge does not authenticate, emit credentials or change the active user;
+the normal MAC verification and credential decoding still apply to the retry.
+
+Nonempty decoded blobs shorter than the IV, checksum and one ciphertext byte
+are rejected before slicing or DH calculation. Errors do not include the blob.
+The public-key challenge is logged at info level without account or key material.
+
+Synthetic tests cover the probe and its current public key, the subsequent
+successful encrypted login, rejection of a modified MAC after the probe, and
+all truncated blob lengths. The request/response behavior was also checked on
+a Mini 2 without starting playback.
+
 ## Checks
 
 The Spotiya integration is checked with Rust 1.98.0, rustls and the ALSA backend.
 From this repository:
 
 ```sh
-cargo +1.98.0 fmt -p librespot-core -p librespot-audio -- --check
-cargo +1.98.0 clippy --locked -p librespot-core -p librespot-audio \
+cargo +1.98.0 fmt -p librespot-core -p librespot-audio -p librespot-discovery -- --check
+cargo +1.98.0 clippy --locked -p librespot-core -p librespot-audio -p librespot-discovery \
   --no-default-features \
-  --features librespot-core/rustls-tls-webpki-roots,librespot-audio/rustls-tls-webpki-roots \
+  --features librespot-core/rustls-tls-webpki-roots,librespot-audio/rustls-tls-webpki-roots,librespot-discovery/rustls-tls-webpki-roots \
   --all-targets -- -D warnings
-cargo +1.98.0 test --locked -p librespot-core -p librespot-audio \
+cargo +1.98.0 test --locked -p librespot-core -p librespot-audio -p librespot-discovery \
   --no-default-features \
-  --features librespot-core/rustls-tls-webpki-roots,librespot-audio/rustls-tls-webpki-roots \
+  --features librespot-core/rustls-tls-webpki-roots,librespot-audio/rustls-tls-webpki-roots,librespot-discovery/rustls-tls-webpki-roots \
   --lib
 ```
 
