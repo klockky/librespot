@@ -2,8 +2,8 @@
 extern crate log;
 
 mod decrypt;
-pub mod playplay;
 mod fetch;
+pub mod playplay;
 
 mod range_set;
 
