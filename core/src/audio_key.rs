@@ -8,7 +8,7 @@ use tokio::sync::oneshot;
 use crate::{
     Error, FileId, SpotifyId,
     packet::PacketType,
-    playplay::{PlayPlayConfig, PlayPlayKey},
+    playplay::{PlayPlayConfig, PlayPlayKey, PlayPlayResolver},
     util::SeqGenerator,
 };
 
@@ -46,11 +46,17 @@ impl From<AudioKeyError> for Error {
     }
 }
 
+#[derive(Clone)]
+enum PlayPlayProvider {
+    Ready(PlayPlayConfig),
+    Lazy(PlayPlayResolver),
+}
+
 component! {
     AudioKeyManager : AudioKeyManagerInner {
         sequence: SeqGenerator<u32> = SeqGenerator::new(0),
         pending: HashMap<u32, oneshot::Sender<Result<AudioKey, Error>>> = HashMap::new(),
-        playplay: Option<PlayPlayConfig> = None,
+        playplay: Option<PlayPlayProvider> = None,
     }
 }
 
@@ -129,7 +135,11 @@ impl AudioKeyManager {
     }
 
     pub fn set_playplay(&self, config: Option<PlayPlayConfig>) {
-        self.lock(|inner| inner.playplay = config);
+        self.lock(|inner| inner.playplay = config.map(PlayPlayProvider::Ready));
+    }
+
+    pub fn set_playplay_resolver(&self, resolver: Option<PlayPlayResolver>) {
+        self.lock(|inner| inner.playplay = resolver.map(PlayPlayProvider::Lazy));
     }
 
     pub fn playplay_enabled(&self) -> bool {
@@ -141,19 +151,44 @@ impl AudioKeyManager {
         track: SpotifyId,
         file: FileId,
     ) -> Result<AudioKeyMaterial, Error> {
-        match self.request(track, file).await {
+        let result = self.request(track, file).await;
+        let session = self.session();
+        self.material_from_result(result, |config| async move {
+            config.request(&session, file).await
+        })
+        .await
+    }
+
+    async fn material_from_result<F, Fut>(
+        &self,
+        result: Result<AudioKey, Error>,
+        request: F,
+    ) -> Result<AudioKeyMaterial, Error>
+    where
+        F: FnOnce(PlayPlayConfig) -> Fut,
+        Fut: std::future::Future<Output = Result<PlayPlayKey, Error>>,
+    {
+        match result {
             Ok(key) => Ok(AudioKeyMaterial::Aes(key)),
             Err(error) => {
                 let refused = matches!(
                     error.error.downcast_ref::<AudioKeyError>(),
                     Some(AudioKeyError::AesKey)
                 );
-                let config = self.lock(|inner| inner.playplay.clone());
-                let Some(config) = config.filter(|_| refused) else {
+                let provider = self.lock(|inner| inner.playplay.clone());
+                let Some(provider) = provider.filter(|_| refused) else {
                     return Err(error);
                 };
                 info!(target: "librespot_core::playplay", "AP audio key refused; trying PlayPlay");
-                match config.request(&self.session(), file).await {
+                let result = async {
+                    let config = match provider {
+                        PlayPlayProvider::Ready(config) => config,
+                        PlayPlayProvider::Lazy(resolve) => resolve().await?,
+                    };
+                    request(config).await
+                }
+                .await;
+                match result {
                     Ok(key) => Ok(AudioKeyMaterial::PlayPlay(key)),
                     Err(error) => {
                         error!("PlayPlay audio key unavailable: {error}");
@@ -191,6 +226,114 @@ impl Drop for PendingRequest {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    fn config() -> PlayPlayConfig {
+        PlayPlayConfig::new("synthetic-decoder".into(), 5, [3; 16]).unwrap()
+    }
+
+    fn license(config: &PlayPlayConfig) -> Result<PlayPlayKey, Error> {
+        let mut bytes = vec![0x0a, 16];
+        bytes.extend_from_slice(&[1; 16]);
+        bytes.extend_from_slice(&[0x12, 4]);
+        bytes.extend_from_slice(&[2; 4]);
+        config.parse_response(&bytes)
+    }
+
+    fn resolver(counter: Arc<AtomicUsize>) -> PlayPlayResolver {
+        Arc::new(move || {
+            counter.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { Ok(config()) })
+        })
+    }
+
+    #[tokio::test]
+    async fn ordinary_key_never_resolves_or_requests_playplay() {
+        let session = crate::Session::new(Default::default(), None);
+        let manager = session.audio_key();
+        let calls = Arc::new(AtomicUsize::new(0));
+        manager.set_playplay_resolver(Some(resolver(calls.clone())));
+        let key = AudioKey([7; 16]);
+        let result = manager
+            .material_from_result(Ok(key), |_| async {
+                panic!("PlayPlay must not be requested for a valid ordinary key")
+            })
+            .await
+            .unwrap();
+        assert!(matches!(result, AudioKeyMaterial::Aes(value) if value == key));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn transport_errors_never_start_the_playplay_resolver() {
+        let session = crate::Session::new(Default::default(), None);
+        let manager = session.audio_key();
+        let calls = Arc::new(AtomicUsize::new(0));
+        manager.set_playplay_resolver(Some(resolver(calls.clone())));
+        for error in [
+            AudioKeyError::Timeout.into(),
+            AudioKeyError::Channel.into(),
+            AudioKeyError::Packet(1).into(),
+            AudioKeyError::Sequence(7).into(),
+            Error::data_loss("synthetic malformed key"),
+        ] {
+            let kind = error.kind;
+            let result = manager
+                .material_from_result(Err(error), |_| async {
+                    panic!("Transport failure must not request PlayPlay")
+                })
+                .await;
+            assert_eq!(result.err().unwrap().kind, kind);
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn explicit_refusal_resolves_playplay_then_requests_a_key() {
+        let session = crate::Session::new(Default::default(), None);
+        let manager = session.audio_key();
+        let calls = Arc::new(AtomicUsize::new(0));
+        manager.set_playplay_resolver(Some(resolver(calls.clone())));
+        let result = manager
+            .material_from_result(Err(AudioKeyError::AesKey.into()), |config| async move {
+                license(&config)
+            })
+            .await
+            .unwrap();
+        assert!(matches!(result, AudioKeyMaterial::PlayPlay(_)));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        manager.set_playplay_resolver(None);
+        assert!(!manager.playplay_enabled());
+        assert!(
+            manager
+                .material_from_result(Err(AudioKeyError::AesKey.into()), |_| async {
+                    panic!("Missing provider must not request PlayPlay")
+                })
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn resolver_failure_stops_before_the_playplay_request() {
+        let session = crate::Session::new(Default::default(), None);
+        let manager = session.audio_key();
+        manager.set_playplay_resolver(Some(Arc::new(|| {
+            Box::pin(async { Err(Error::unavailable("synthetic missing decoder")) })
+        })));
+        let result = manager
+            .material_from_result(Err(AudioKeyError::AesKey.into()), |_| async {
+                panic!("Failed decoder configuration must not request PlayPlay")
+            })
+            .await;
+        assert_eq!(
+            result.err().unwrap().kind,
+            crate::error::ErrorKind::Unavailable
+        );
+    }
 
     #[tokio::test]
     async fn malformed_packets_fail_the_waiter_without_panicking() {

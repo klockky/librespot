@@ -1,6 +1,7 @@
 use std::{
     fmt,
     path::{Path, PathBuf},
+    sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -10,6 +11,12 @@ use hyper::{
 };
 
 use crate::{Error, FileId, Session};
+
+pub type PlayPlayResolver = Arc<
+    dyn Fn() -> futures_util::future::BoxFuture<'static, Result<PlayPlayConfig, Error>>
+        + Send
+        + Sync,
+>;
 
 #[derive(Clone)]
 pub struct PlayPlayConfig {

@@ -114,3 +114,12 @@ cargo +1.98.0 test --locked -p librespot-core -p librespot-audio \
 The test suite uses synthetic responses and temporary files. The receiver,
 ARMv7 ABI checks and optional offline sample comparison live in
 [klockky/spotiya](https://github.com/klockky/spotiya).
+
+## Lazy decoder configuration
+
+`AudioKeyManager::set_playplay_resolver()` accepts an asynchronous configuration
+provider. It is invoked only after a typed AP audio-key refusal; a successful
+ordinary key, malformed packet, timeout or transport failure never invokes it.
+The caller can cache configuration across sessions. The existing
+`set_playplay()` API remains available for callers with an existing configuration.
+Resolver failure stops the fallback before any PlayPlay request.
