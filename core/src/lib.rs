@@ -27,6 +27,7 @@ pub mod login5;
 mod login5_credentials;
 pub mod mercury;
 pub mod packet;
+pub mod playplay;
 mod proxytunnel;
 pub mod session;
 mod socket;
