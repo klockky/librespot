@@ -39,7 +39,7 @@ impl Converter {
     /// of the most significant bit in each format's full-scale representation.
     /// For signed integers in two's complement, full scale is 2^(bits-1).
     const SHIFT_S16: u8 = 15; // 16-bit: 2^15 = 32768
-    const SHIFT_S24: u8 = 23; // 24-bit: 2^23 = 8388608  
+    const SHIFT_S24: u8 = 23; // 24-bit: 2^23 = 8388608
     const SHIFT_S32: u8 = 31; // 32-bit: 2^31 = 2147483648
 
     /// Additional bit shifts needed to scale from 16-bit to higher bit depths.

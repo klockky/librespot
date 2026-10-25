@@ -361,6 +361,10 @@ impl Cache {
         }
     }
 
+    pub(crate) fn credentials_directory(&self) -> Option<&Path> {
+        self.credentials_location.as_deref()?.parent()
+    }
+
     pub fn save_credentials(&self, cred: &Credentials) {
         if let Some(credentials) = &self.memory_credentials {
             *credentials.lock().unwrap_or_else(PoisonError::into_inner) = Some(cred.clone());

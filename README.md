@@ -1,3 +1,6 @@
+> This branch contains the changes used by [Spotiya](https://github.com/klockky/spotiya),
+> merged with upstream dev. See [SPOTIYA.md](SPOTIYA.md) for the changes and checks.
+
 [![Build Status](https://github.com/librespot-org/librespot/workflows/build/badge.svg)](https://github.com/librespot-org/librespot/actions)
 [![Gitter chat](https://badges.gitter.im/librespot-org/librespot.png)](https://gitter.im/librespot-org/spotify-connect-resources)
 [![Crates.io](https://img.shields.io/crates/v/librespot.svg)](https://crates.io/crates/librespot)

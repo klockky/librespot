@@ -1011,6 +1011,7 @@ impl PlayerTrackLoader {
         track_uri: SpotifyUri,
         position_ms: u32,
     ) -> Option<PlayerLoadedTrackData> {
+        let encrypted_track = matches!(&track_uri, SpotifyUri::Track { .. });
         let track_id: SpotifyId = match (&track_uri).try_into() {
             Ok(id) => id,
             Err(_) => {
@@ -1107,18 +1108,38 @@ impl PlayerTrackLoader {
 
             let stream_loader_controller = encrypted_file.get_stream_loader_controller().ok()?;
 
-            // Not all audio files are encrypted. If we can't get a key, try loading the track
-            // without decryption. If the file was encrypted after all, the decoder will fail
-            // parsing and bail out, so we should be safe from outputting ear-piercing noise.
-            let key = match self.session.audio_key().request(track_id, file_id).await {
+            let key = match self
+                .session
+                .audio_key()
+                .request_material(track_id, file_id)
+                .await
+            {
                 Ok(key) => Some(key),
+                Err(e) if encrypted_track => {
+                    error!("Unable to obtain an audio key: {e}");
+                    return None;
+                }
                 Err(e) => {
                     warn!("Unable to load key, continuing without decryption: {e}");
                     None
                 }
             };
 
-            let mut decrypted_file = AudioDecrypt::new(key, encrypted_file);
+            let mut decrypted_file = match tokio::task::spawn_blocking(move || {
+                AudioDecrypt::new_material(key, encrypted_file)
+            })
+            .await
+            {
+                Ok(Ok(file)) => file,
+                Ok(Err(error)) => {
+                    error!("Unable to initialize audio decryption: {error}");
+                    return None;
+                }
+                Err(error) => {
+                    error!("Audio decryption setup task failed: {error}");
+                    return None;
+                }
+            };
 
             let is_ogg_vorbis = AudioFiles::is_ogg_vorbis(format);
             let (offset, mut normalisation_data) = if is_ogg_vorbis {
