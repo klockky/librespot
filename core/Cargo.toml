@@ -94,6 +94,7 @@ sha1 = { version = "0.10", features = ["oid"] }
 shannon = "0.2"
 sysinfo = { version = "0.36", default-features = false, features = ["system"] }
 thiserror = "2"
+tempfile = "3"
 time = { version = "0.3", features = ["formatting", "parsing"] }
 tokio = { version = "1", features = [
     "io-util",
@@ -117,4 +118,4 @@ vergen-gitcl = { version = "1.0", default-features = false, features = [
 ] }
 
 [dev-dependencies]
-tokio = { version = "1", features = ["macros"] }
+tokio = { version = "1", features = ["macros", "test-util"] }

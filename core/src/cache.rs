@@ -334,6 +334,10 @@ impl Cache {
         }
     }
 
+    pub(crate) fn credentials_directory(&self) -> Option<&Path> {
+        self.credentials_location.as_deref()?.parent()
+    }
+
     pub fn save_credentials(&self, cred: &Credentials) {
         if let Some(location) = &self.credentials_location {
             let result = File::create(location).and_then(|mut file| {

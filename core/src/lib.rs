@@ -24,6 +24,7 @@ pub mod error;
 pub mod file_id;
 pub mod http_client;
 pub mod login5;
+mod login5_credentials;
 pub mod mercury;
 pub mod packet;
 mod proxytunnel;
